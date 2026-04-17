@@ -120,6 +120,7 @@ func powershellHookScript() string {
 $env:PATH = "%s;$env:PATH"
 $Global:AuthSecShieldValidation = {
     param([string]$CommandLine)
+    if ($env:AUTHSEC_SHIELD_ACTIVE -eq "1") { return }
     $result = & "%s" check $CommandLine 2>&1
     if ($LASTEXITCODE -ne 0) {
         throw "Blocked by AuthSec Agent Shield"
@@ -130,6 +131,7 @@ Set-PSReadLineOption -CommandValidationHandler $Global:AuthSecShieldValidation
 function global:Invoke-AuthSecShieldCheck {
     param([string]$CommandLine)
     if ([string]::IsNullOrWhiteSpace($CommandLine)) { return }
+    if ($env:AUTHSEC_SHIELD_ACTIVE -eq "1") { return }
     & "%s" check $CommandLine 2>&1 | Out-Null
     if ($LASTEXITCODE -ne 0) {
         throw "Blocked by AuthSec Agent Shield"

@@ -176,21 +176,35 @@ func cmdLogin() {
 		fatal("Failed to load config: %v", err)
 	}
 
+	if cfg.ClientID == "" {
+		fatal("Not configured. Run 'authsec-shield setup --client-id <id> --base-url <url>' first.")
+	}
+
 	client := auth.NewClient(cfg)
 
-	deviceResp, err := client.InitiateDeviceLogin()
+	// Step 1+2: Get device code + auth URL
+	fmt.Println("Initiating login...")
+	deviceResp, authResp, err := client.InitiateLogin()
 	if err != nil {
 		fatal("Login failed: %v", err)
 	}
 
 	fmt.Println()
 	fmt.Println("===========================================")
-	fmt.Printf("  Open:  %s\n", deviceResp.VerificationURI)
-	fmt.Printf("  Code:  %s\n", deviceResp.UserCode)
+	fmt.Printf("  Open this URL to authenticate:\n")
+	fmt.Println()
+	if authResp != nil {
+		fmt.Printf("  %s\n", authResp.AuthURL)
+	} else {
+		fmt.Printf("  %s\n", deviceResp.VerificationURI)
+	}
+	fmt.Println()
+	fmt.Printf("  Then enter this code:  %s\n", deviceResp.UserCode)
 	fmt.Println("===========================================")
 	fmt.Println()
-	fmt.Println("Waiting for you to authenticate in the browser...")
+	fmt.Println("Waiting for you to authenticate and enter the code...")
 
+	// Step 3: Poll for token (backend releases it after user authenticates + enters code)
 	tokenResp, err := client.PollForToken(deviceResp.DeviceCode, deviceResp.Interval, deviceResp.ExpiresIn)
 	if err != nil {
 		fatal("Login failed: %v", err)
@@ -587,6 +601,9 @@ func containsStr(slice []string, s string) bool {
 // ========================================
 
 func cmdInstall() {
+	// Set env var so the shield's own hooks don't intercept install operations
+	os.Setenv("AUTHSEC_SHIELD_ACTIVE", "1")
+
 	cfg, err := config.Load()
 	if err != nil {
 		fatal("Failed to load config: %v", err)
@@ -1164,9 +1181,11 @@ func cmdCheck() {
 		os.Exit(0)
 	}
 
-	// CRITICAL: Only intercept AI-initiated commands, not human-typed ones.
-	// If the command was typed directly by the user in an interactive terminal,
-	// let it through — the shield is for protecting against AI tools, not the user.
+	// Skip if shield itself is running install/uninstall
+	if os.Getenv("AUTHSEC_SHIELD_ACTIVE") == "1" {
+		os.Exit(0)
+	}
+
 	cfg, err := config.Load()
 	if err != nil || !cfg.IsLoggedIn() || !cfg.Enabled {
 		os.Exit(0) // Not configured, pass through
@@ -1499,6 +1518,11 @@ func parseRunArgs(args []string) (string, []string, error) {
 }
 
 func enforceCommand(command string) (*risk.Evaluation, error) {
+	// Skip if shield itself is running (install/uninstall operations)
+	if os.Getenv("AUTHSEC_SHIELD_ACTIVE") == "1" {
+		return nil, nil
+	}
+
 	cfg, err := config.Load()
 	if err != nil || !cfg.IsLoggedIn() || !cfg.Enabled {
 		return nil, nil

@@ -15,6 +15,7 @@ package wrappers
 import (
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -34,8 +35,10 @@ var ShimmedCommands = []string{
 	"docker", "kubectl", "helm", "terraform",
 	// Cloud CLIs
 	"aws", "gcloud", "az",
-	// Git (the binary itself — catches all git subcommands)
-	"git",
+	// NOTE: git is NOT shimmed — it self-calls internally hundreds of times
+	// causing fork bombs. Git is protected via shell hooks + PATH wrappers instead.
+	// Database CLIs
+	"mysql", "psql", "mongosh", "sqlcmd", "redis-cli", "sqlite3",
 }
 
 // ShimStatus describes the state of a single command shim
@@ -101,6 +104,13 @@ func InstallShims(shieldBin string) ([]ShimStatus, error) {
 			}
 			results = append(results, status)
 			continue
+		}
+
+		// On Windows, take ownership first so we can move/replace the binary
+		if runtime.GOOS == "windows" {
+			takeOwnership(realPath)
+			// Also take ownership of the parent dir for writing the backup
+			takeOwnership(filepath.Dir(realPath))
 		}
 
 		// Move real binary to backup
@@ -419,7 +429,39 @@ func placeShim(shieldBin, targetPath string) error {
 
 	perm := os.FileMode(0755)
 	if err := os.WriteFile(targetPath, src, perm); err != nil {
+		// On Windows, Program Files may need takeown + icacls grant first
+		if runtime.GOOS == "windows" {
+			if takeErr := takeOwnership(targetPath); takeErr == nil {
+				if err2 := os.WriteFile(targetPath, src, perm); err2 == nil {
+					return nil
+				}
+			}
+		}
 		return fmt.Errorf("failed to write shim: %w", err)
+	}
+
+	return nil
+}
+
+// takeOwnership takes ownership of a file/path and grants full control.
+// Needed on Windows to write to Program Files.
+// Uses cmd.exe /C to avoid MSYS2/Git Bash path mangling.
+func takeOwnership(path string) error {
+	// Ensure we have a clean Windows path (not a MSYS2 converted one)
+	absPath, _ := filepath.Abs(path)
+
+	// takeown /f <path>
+	cmd1 := exec.Command("cmd.exe", "/C", "takeown", "/f", absPath)
+	cmd1.Env = append(os.Environ(), "MSYS_NO_PATHCONV=1")
+	if _, err := cmd1.CombinedOutput(); err != nil {
+		return err
+	}
+
+	// icacls <path> /grant Administrators:F
+	cmd2 := exec.Command("cmd.exe", "/C", "icacls", absPath, "/grant", "Administrators:F")
+	cmd2.Env = append(os.Environ(), "MSYS_NO_PATHCONV=1")
+	if _, err := cmd2.CombinedOutput(); err != nil {
+		return err
 	}
 
 	return nil

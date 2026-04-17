@@ -48,24 +48,14 @@ func DefaultConfig() *Config {
 		AutoApproveRead: true,
 		MCPProxyEnabled: true,
 		MCPProxyPort:    18900,
+		// Only protect small, critical credential directories.
+		// Large dirs like .config, C:\Windows, /var cause icacls/chattr to hang.
 		ProtectedPaths: func() []string {
-			if runtime.GOOS == "windows" {
-				return []string{
-					filepath.Join(home, ".ssh"),
-					filepath.Join(home, ".aws"),
-					filepath.Join(home, ".kube"),
-					filepath.Join(home, ".config"),
-					`C:\Windows`,
-					`C:\Program Files`,
-				}
-			}
 			return []string{
 				filepath.Join(home, ".ssh"),
 				filepath.Join(home, ".aws"),
 				filepath.Join(home, ".kube"),
-				filepath.Join(home, ".config"),
-				"/etc",
-				"/var",
+				filepath.Join(home, ".env"),
 			}
 		}(),
 		// DangerousCommands are PATTERNS that are always high-risk.
