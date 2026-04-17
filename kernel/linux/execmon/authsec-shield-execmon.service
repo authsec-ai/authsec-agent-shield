@@ -1,0 +1,56 @@
+[Unit]
+Description=AuthSec Agent Shield — exec monitor (intercepts ALL process executions)
+Documentation=https://github.com/authsec-ai/authsec-agent-shield
+After=network-online.target
+Wants=network-online.target
+# Run alongside the filesystem write monitor
+After=authsec-shield-fanotify.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/sbin/authsec-shield-execmon
+Restart=always
+RestartSec=1
+StartLimitIntervalSec=0    # never stop restarting
+
+# Must run as root (CAP_SYS_ADMIN for fanotify, CAP_SYS_PTRACE for process_vm_readv)
+User=root
+Group=root
+
+# OOM protection — kernel will kill other processes before this one
+OOMScoreAdjust=-1000
+
+# Watchdog — systemd restarts us if we don't ping in 30s
+WatchdogSec=30
+
+# Hardening — limit what the daemon itself can do
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+RestrictRealtime=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=no   # needed for eBPF JIT
+
+# Allow reading /proc entries of all processes
+ReadWritePaths=/proc
+ReadWritePaths=/run
+
+# Config and tokens
+EnvironmentFile=-/etc/authsec-shield/daemon.env
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=authsec-shield-execmon
+
+# Capabilities needed:
+#   CAP_SYS_ADMIN  - fanotify_init with FAN_CLASS_CONTENT
+#   CAP_SYS_PTRACE - process_vm_readv for argv fallback
+#   CAP_BPF        - load eBPF programs (Linux 5.8+)
+#   CAP_PERFMON    - attach eBPF tracepoints (Linux 5.8+)
+AmbientCapabilities=CAP_SYS_ADMIN CAP_SYS_PTRACE CAP_BPF CAP_PERFMON
+CapabilityBoundingSet=CAP_SYS_ADMIN CAP_SYS_PTRACE CAP_BPF CAP_PERFMON
+
+[Install]
+WantedBy=multi-user.target

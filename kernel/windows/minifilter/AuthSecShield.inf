@@ -1,0 +1,70 @@
+; AuthSec Agent Shield — Minifilter Driver INF
+; Used by Windows Setup / PnP to install the driver.
+;
+; Install:
+;   Right-click AuthSecShield.inf → Install
+;   -or- infdefaultinstall.exe AuthSecShield.inf
+;   Then: fltMC load AuthSecShield
+
+[Version]
+Signature   = "$Windows NT$"
+Class       = "ActivityMonitor"
+ClassGuid   = {b86dff51-a31e-4bac-b3cf-e8cfe75c9fc2}
+Provider    = %ProviderName%
+DriverVer   = 04/14/2026, 1.0.0.0
+CatalogFile = AuthSecShield.cat
+PnpLockdown = 1
+
+[DestinationDirs]
+DefaultDestDir          = 12     ; %SystemRoot%\system32\drivers
+AuthSecShield.DriverFiles = 12
+
+[SourceDisksNames]
+1 = %DiskId%,,,""
+
+[SourceDisksFiles]
+AuthSecShield.sys = 1,,
+
+[DefaultInstall.NTamd64]
+CopyFiles = AuthSecShield.DriverFiles
+AddReg    = AuthSecShield.AddRegistry
+
+[DefaultInstall.NTamd64.Services]
+AddService = AuthSecShield,0x14,AuthSecShield.Service
+
+[DefaultUninstall.NTamd64]
+DelFiles   = AuthSecShield.DriverFiles
+DelReg     = AuthSecShield.DelRegistry
+
+[DefaultUninstall.NTamd64.Services]
+DelService = AuthSecShield,0x200    ; 0x200 = SPSVCINST_STOPSERVICE
+
+[AuthSecShield.DriverFiles]
+AuthSecShield.sys
+
+[AuthSecShield.AddRegistry]
+HKLM,"SYSTEM\CurrentControlSet\Services\AuthSecShield","SupportedFeatures",0x00010001,0x3
+HKLM,"SYSTEM\CurrentControlSet\Services\AuthSecShield\Instances","DefaultInstance",0x00000000,%DefaultInstance%
+HKLM,"SYSTEM\CurrentControlSet\Services\AuthSecShield\Instances\%DefaultInstance%","Altitude",0x00000000,%FilterAltitude%
+HKLM,"SYSTEM\CurrentControlSet\Services\AuthSecShield\Instances\%DefaultInstance%","Flags",0x00010001,0x0
+
+[AuthSecShield.DelRegistry]
+HKLM,"SYSTEM\CurrentControlSet\Services\AuthSecShield"
+
+[AuthSecShield.Service]
+DisplayName    = %ServiceName%
+Description    = %ServiceDescription%
+ServiceBinary  = %12%\AuthSecShield.sys
+ServiceType    = 2   ; SERVICE_FILE_SYSTEM_DRIVER
+StartType      = 0   ; SERVICE_BOOT_START (loads early — before user-mode processes)
+ErrorControl   = 1   ; SERVICE_ERROR_NORMAL
+LoadOrderGroup = "FSFilter Activity Monitor"
+AddReg         = AuthSecShield.AddRegistry
+
+[Strings]
+ProviderName       = "AuthSec AI"
+ServiceName        = "AuthSec Agent Shield"
+ServiceDescription = "Kernel-level filesystem protection for AI agent action approval"
+DiskId             = "AuthSec Agent Shield Installation Disk"
+DefaultInstance    = "AuthSecShield Instance"
+FilterAltitude     = "370030"

@@ -1,0 +1,37 @@
+[Unit]
+Description=AuthSec Agent Shield — fanotify kernel protection daemon
+Documentation=https://github.com/authsec-ai/authsec-agent-shield
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/sbin/authsec-shield-fanotify
+Restart=always
+RestartSec=5
+
+# Must run as root for CAP_SYS_ADMIN (required by fanotify permission events)
+User=root
+Group=root
+
+# Harden the service itself
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+RestrictRealtime=yes
+RestrictNamespaces=yes
+
+# Allow writing to fanotify fd (required)
+ReadWritePaths=/proc
+
+# Config and state
+EnvironmentFile=-/etc/authsec-shield/daemon.env
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=authsec-shield-fanotify
+
+[Install]
+WantedBy=multi-user.target
