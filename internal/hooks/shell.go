@@ -88,7 +88,7 @@ else
     __authsec_shield_trap() {
         [ -n "$COMP_LINE" ] && return
         [ "$BASH_COMMAND" = "$PROMPT_COMMAND" ] && return
-        authsec_shield_preexec "$BASH_COMMAND"
+        authsec_shield_preexec "$BASH_COMMAND" || kill -SIGINT $$
     }
     trap '__authsec_shield_trap' DEBUG
 fi
@@ -132,7 +132,7 @@ function global:Invoke-AuthSecShieldCheck {
     param([string]$CommandLine)
     if ([string]::IsNullOrWhiteSpace($CommandLine)) { return }
     if ($env:AUTHSEC_SHIELD_ACTIVE -eq "1") { return }
-    & "%s" check $CommandLine 2>&1 | Out-Null
+    $null = & "%s" check $CommandLine
     if ($LASTEXITCODE -ne 0) {
         throw "Blocked by AuthSec Agent Shield"
     }

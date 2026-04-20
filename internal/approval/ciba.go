@@ -88,6 +88,10 @@ func (c *Client) RequestApproval(eval *risk.Evaluation) (*Result, error) {
 		return nil, fmt.Errorf("failed to read Agent Guard response: %w", err)
 	}
 
+	if resp.StatusCode >= 400 {
+		return nil, fmt.Errorf("Agent Guard API error %d: %s", resp.StatusCode, strings.TrimSpace(string(respBody)))
+	}
+
 	var evalResp evaluateResponse
 	if err := json.Unmarshal(respBody, &evalResp); err != nil {
 		return nil, fmt.Errorf("failed to parse response: %w", err)
