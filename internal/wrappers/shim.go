@@ -52,6 +52,8 @@ type ShimStatus struct {
 }
 
 // InstallShims replaces real binaries with shield shims.
+// It shims ALL occurrences of each command found in PATH so that stray copies
+// earlier in PATH (e.g. ~/kubectl.exe) cannot bypass the shield.
 // Requires elevated privileges (sudo/admin).
 func InstallShims(shieldBin string) ([]ShimStatus, error) {
 	if shieldBin == "" {
@@ -66,71 +68,63 @@ func InstallShims(shieldBin string) ([]ShimStatus, error) {
 	var results []ShimStatus
 
 	for _, cmd := range ShimmedCommands {
-		status := ShimStatus{Command: cmd}
-
-		// Find the real binary
-		realPath := findSystemBinary(cmd)
-		if realPath == "" {
-			status.Error = "not found on system"
-			results = append(results, status)
+		// Find ALL occurrences of this binary in PATH so every copy gets shimmed.
+		// A stray binary earlier in PATH (e.g. C:\Users\foo\kubectl.exe) would
+		// otherwise bypass the shield installed at the canonical system location.
+		allPaths := findAllSystemBinaries(cmd)
+		if len(allPaths) == 0 {
+			results = append(results, ShimStatus{Command: cmd, Error: "not found on system"})
 			continue
 		}
-		status.RealPath = realPath
 
-		// Compute backup path
-		dir := filepath.Dir(realPath)
-		base := filepath.Base(realPath)
-		backupName := "." + stripExtension(base) + backupSuffix
-		if ext := filepath.Ext(base); ext != "" {
-			backupName += ext
-		}
-		status.BackupPath = filepath.Join(dir, backupName)
-		status.ShimPath = realPath
+		for _, realPath := range allPaths {
+			status := ShimStatus{Command: cmd, RealPath: realPath, ShimPath: realPath}
 
-		// Check if already shimmed
-		if isShimmed(realPath, shieldBin) {
+			dir := filepath.Dir(realPath)
+			base := filepath.Base(realPath)
+			backupName := "." + stripExtension(base) + backupSuffix
+			if ext := filepath.Ext(base); ext != "" {
+				backupName += ext
+			}
+			status.BackupPath = filepath.Join(dir, backupName)
+
+			if isShimmed(realPath, shieldBin) {
+				status.Installed = true
+				results = append(results, status)
+				continue
+			}
+
+			if _, err := os.Stat(status.BackupPath); err == nil {
+				if err := placeShim(shieldBin, realPath); err != nil {
+					status.Error = fmt.Sprintf("failed to place shim: %v", err)
+				} else {
+					status.Installed = true
+				}
+				results = append(results, status)
+				continue
+			}
+
+			if runtime.GOOS == "windows" {
+				takeOwnership(realPath)
+				takeOwnership(filepath.Dir(realPath))
+			}
+
+			if err := os.Rename(realPath, status.BackupPath); err != nil {
+				status.Error = fmt.Sprintf("failed to backup original (need sudo/admin?): %v", err)
+				results = append(results, status)
+				continue
+			}
+
+			if err := placeShim(shieldBin, realPath); err != nil {
+				os.Rename(status.BackupPath, realPath)
+				status.Error = fmt.Sprintf("failed to place shim: %v", err)
+				results = append(results, status)
+				continue
+			}
+
 			status.Installed = true
 			results = append(results, status)
-			continue
 		}
-
-		// Check if backup already exists (previous partial install)
-		if _, err := os.Stat(status.BackupPath); err == nil {
-			// Backup exists — the real binary is already moved, just need to place shim
-			if err := placeShim(shieldBin, realPath); err != nil {
-				status.Error = fmt.Sprintf("failed to place shim: %v", err)
-			} else {
-				status.Installed = true
-			}
-			results = append(results, status)
-			continue
-		}
-
-		// On Windows, take ownership first so we can move/replace the binary
-		if runtime.GOOS == "windows" {
-			takeOwnership(realPath)
-			// Also take ownership of the parent dir for writing the backup
-			takeOwnership(filepath.Dir(realPath))
-		}
-
-		// Move real binary to backup
-		if err := os.Rename(realPath, status.BackupPath); err != nil {
-			status.Error = fmt.Sprintf("failed to backup original (need sudo/admin?): %v", err)
-			results = append(results, status)
-			continue
-		}
-
-		// Place shim at original location
-		if err := placeShim(shieldBin, realPath); err != nil {
-			// Rollback: move backup back
-			os.Rename(status.BackupPath, realPath)
-			status.Error = fmt.Sprintf("failed to place shim: %v", err)
-			results = append(results, status)
-			continue
-		}
-
-		status.Installed = true
-		results = append(results, status)
 	}
 
 	return results, nil
@@ -263,48 +257,46 @@ func IsShimInvocation() (bool, string) {
 	return false, ""
 }
 
-// DiagnoseShims reports the status of all shims
+// DiagnoseShims reports the status of all shims, checking every occurrence of
+// each command in PATH so stray unshimmed copies are surfaced as issues.
 func DiagnoseShims() []ShimStatus {
 	var results []ShimStatus
 
 	shieldBin, _ := os.Executable()
 
 	for _, cmd := range ShimmedCommands {
-		status := ShimStatus{Command: cmd}
-
-		realPath := findSystemBinary(cmd)
-		if realPath == "" {
-			status.Error = "not found on system"
-			results = append(results, status)
+		allPaths := findAllSystemBinaries(cmd)
+		if len(allPaths) == 0 {
+			results = append(results, ShimStatus{Command: cmd, Error: "not found on system"})
 			continue
 		}
 
-		status.RealPath = realPath
-		status.ShimPath = realPath
+		for _, realPath := range allPaths {
+			status := ShimStatus{Command: cmd, RealPath: realPath, ShimPath: realPath}
 
-		dir := filepath.Dir(realPath)
-		base := filepath.Base(realPath)
-		backupName := "." + stripExtension(base) + backupSuffix
-		if ext := filepath.Ext(base); ext != "" {
-			backupName += ext
-		}
-		status.BackupPath = filepath.Join(dir, backupName)
-
-		if _, err := os.Stat(status.BackupPath); err == nil {
-			// Backup exists, check if current binary is the shim
-			if isShimmed(realPath, shieldBin) {
-				status.Installed = true
-			} else {
-				status.Error = "backup exists but shim not in place"
+			dir := filepath.Dir(realPath)
+			base := filepath.Base(realPath)
+			backupName := "." + stripExtension(base) + backupSuffix
+			if ext := filepath.Ext(base); ext != "" {
+				backupName += ext
 			}
-		} else if isShimmed(realPath, shieldBin) {
-			status.Installed = true
-			status.Error = "shim in place but backup missing"
-		} else {
-			status.Error = "not shimmed"
-		}
+			status.BackupPath = filepath.Join(dir, backupName)
 
-		results = append(results, status)
+			if _, err := os.Stat(status.BackupPath); err == nil {
+				if isShimmed(realPath, shieldBin) {
+					status.Installed = true
+				} else {
+					status.Error = "backup exists but shim not in place"
+				}
+			} else if isShimmed(realPath, shieldBin) {
+				status.Installed = true
+				status.Error = "shim in place but backup missing"
+			} else {
+				status.Error = "not shimmed"
+			}
+
+			results = append(results, status)
+		}
 	}
 
 	return results
@@ -488,6 +480,55 @@ func isShimmed(path, shieldBin string) bool {
 	}
 
 	return pathInfo.Size() == shieldInfo.Size()
+}
+
+// findAllSystemBinaries returns every occurrence of cmd found in PATH,
+// skipping the wrapper dir. This lets InstallShims shim all copies so a stray
+// binary earlier in PATH cannot bypass the shield.
+func findAllSystemBinaries(cmd string) []string {
+	wrapperDir := WrapperDir()
+
+	var searchPaths []string
+	if runtime.GOOS == "windows" {
+		searchPaths = strings.Split(os.Getenv("PATH"), ";")
+	} else {
+		searchPaths = []string{"/usr/bin", "/usr/local/bin", "/bin", "/sbin", "/usr/sbin"}
+		searchPaths = append(searchPaths, strings.Split(os.Getenv("PATH"), ":")...)
+	}
+
+	var results []string
+	seen := make(map[string]bool)
+
+	for _, dir := range searchPaths {
+		dir = strings.TrimSpace(dir)
+		if dir == "" || samePath(dir, wrapperDir) {
+			continue
+		}
+
+		var candidates []string
+		if runtime.GOOS == "windows" {
+			candidates = []string{
+				filepath.Join(dir, cmd+".exe"),
+				filepath.Join(dir, cmd+".cmd"),
+				filepath.Join(dir, cmd+".bat"),
+			}
+		} else {
+			candidates = []string{filepath.Join(dir, cmd)}
+		}
+
+		for _, c := range candidates {
+			absC := strings.ToLower(filepath.Clean(c))
+			if seen[absC] {
+				continue
+			}
+			if info, err := os.Stat(c); err == nil && !info.IsDir() {
+				results = append(results, c)
+				seen[absC] = true
+				break
+			}
+		}
+	}
+	return results
 }
 
 // findSystemBinary finds a binary in standard system paths (not our wrapper dir)
