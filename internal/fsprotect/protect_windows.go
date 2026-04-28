@@ -11,8 +11,9 @@
 // when the user approves an action, then re-apply it.
 //
 // Human workflow:
-//   authsec-shield pause 1h   → removes DENY ACLs, human can write freely
-//   authsec-shield enable     → re-applies DENY ACLs
+//
+//	authsec-shield pause 1h   → removes DENY ACLs, human can write freely
+//	authsec-shield enable     → re-applies DENY ACLs
 package fsprotect
 
 import (
