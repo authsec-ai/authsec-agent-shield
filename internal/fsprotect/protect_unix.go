@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 )
 
@@ -21,7 +22,19 @@ func ProtectPath(path string) error {
 		return fmt.Errorf("path does not exist: %s", abs)
 	}
 
-	// Try chattr +i (Linux immutable flag — strongest, needs root)
+	if runtime.GOOS == "darwin" {
+		// macOS: chflags schg (system immutable, requires root) is stronger than uchg
+		if err := exec.Command("chflags", "schg", abs).Run(); err == nil {
+			return nil
+		}
+		// Fallback: user immutable (no root needed, but user can undo without root)
+		if err := exec.Command("chflags", "uchg", abs).Run(); err == nil {
+			return nil
+		}
+		return fmt.Errorf("chflags schg/uchg failed for %s; refusing chmod fallback because it cannot be perfectly reverted without a permission snapshot", abs)
+	}
+
+	// Linux: chattr +i (immutable flag — needs root)
 	if err := exec.Command("chattr", "+i", abs).Run(); err == nil {
 		return nil
 	}
@@ -34,6 +47,18 @@ func UnprotectPath(path string) error {
 	abs, err := filepath.Abs(path)
 	if err != nil {
 		return fmt.Errorf("invalid path: %w", err)
+	}
+
+	if runtime.GOOS == "darwin" {
+		// Try removing system immutable first, then user immutable
+		if err := exec.Command("chflags", "noschg", abs).Run(); err == nil {
+			return nil
+		}
+		output, err := exec.Command("chflags", "nouchg", abs).CombinedOutput()
+		if err != nil {
+			return fmt.Errorf("chflags noschg/nouchg failed: %s — %w", strings.TrimSpace(string(output)), err)
+		}
+		return nil
 	}
 
 	output, err := exec.Command("chattr", "-i", abs).CombinedOutput()
@@ -87,19 +112,32 @@ func ForceUnprotectPath(path string) error {
 func IsProtected(path string) bool {
 	abs, _ := filepath.Abs(path)
 
-	// Check immutable flag (Linux)
-	out, err := exec.Command("lsattr", abs).Output()
-	if err == nil && strings.Contains(string(out), "i") {
-		return true
+	if runtime.GOOS == "darwin" {
+		// ls -lO shows BSD flags; look for schg (system immutable) or uchg (user immutable)
+		out, err := exec.Command("ls", "-lO", abs).Output()
+		if err == nil {
+			fields := strings.Fields(string(out))
+			for _, f := range fields {
+				if f == "schg" || f == "uchg" {
+					return true
+				}
+			}
+		}
+	} else {
+		// Linux: check immutable flag via lsattr
+		out, err := exec.Command("lsattr", abs).Output()
+		if err == nil && strings.Contains(string(out), "i") {
+			return true
+		}
 	}
 
-	// Check write permission
+	// Fallback: check write permission bits
 	info, err := os.Stat(abs)
 	if err != nil {
 		return false
 	}
 
-	return info.Mode().Perm()&0222 == 0 // No write bits
+	return info.Mode().Perm()&0222 == 0
 }
 
 // DiagnoseProtection checks all given paths

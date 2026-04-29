@@ -727,6 +727,8 @@ func cmdInstall() {
 				fmt.Println("    make -C kernel/linux/fanotify install")
 			} else if runtime.GOOS == "windows" {
 				fmt.Println("    Build kernel/windows/minifilter/ with WDK, then run install.ps1")
+			} else if runtime.GOOS == "darwin" {
+				fmt.Println("    kernel protection not available on darwin")
 			}
 		} else {
 			kst := km.GetStatus()

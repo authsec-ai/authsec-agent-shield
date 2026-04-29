@@ -110,6 +110,19 @@ func InstallShims(shieldBin string) ([]ShimStatus, error) {
 			}
 
 			if err := os.Rename(realPath, status.BackupPath); err != nil {
+				// On macOS, SIP-protected directories (/bin, /usr/bin, etc.) reject renames
+				// even with sudo. Fall back to placing a shim in /usr/local/bin instead,
+				// which has PATH priority on macOS and is writable.
+				if isSIPProtectedPath(realPath) {
+					shimPath, sipErr := installSIPShim(shieldBin, realPath)
+					if sipErr == nil {
+						status.ShimPath = shimPath
+						status.BackupPath = filepath.Join(filepath.Dir(shimPath), "."+stripExtension(filepath.Base(realPath))+backupSuffix)
+						status.Installed = true
+						results = append(results, status)
+						continue
+					}
+				}
 				status.Error = fmt.Sprintf("failed to backup original (need sudo/admin?): %v", err)
 				results = append(results, status)
 				continue
@@ -158,6 +171,16 @@ func UninstallShims() ([]ShimStatus, error) {
 
 		if _, err := os.Stat(backupPath); os.IsNotExist(err) {
 			status.Error = "no backup found (not shimmed?)"
+			results = append(results, status)
+			continue
+		}
+
+		// SIP shim detection: backup is a symlink (points at the SIP-protected original).
+		// In this case just remove both files — nothing was moved from the protected dir.
+		if backupInfo, lErr := os.Lstat(backupPath); lErr == nil && backupInfo.Mode()&os.ModeSymlink != 0 {
+			os.Remove(realPath)
+			os.Remove(backupPath)
+			status.Installed = false
 			results = append(results, status)
 			continue
 		}
@@ -600,6 +623,51 @@ func stripExtension(name string) string {
 		return strings.TrimSuffix(name, ext)
 	}
 	return name
+}
+
+// isSIPProtectedPath returns true if the path lives inside a macOS SIP-protected
+// directory. These directories reject writes even under sudo.
+func isSIPProtectedPath(path string) bool {
+	if runtime.GOOS != "darwin" {
+		return false
+	}
+	sipDirs := []string{"/bin", "/sbin", "/usr/bin", "/usr/sbin", "/System"}
+	clean := filepath.Clean(path)
+	for _, d := range sipDirs {
+		if strings.HasPrefix(clean, d+string(filepath.Separator)) || clean == d {
+			return true
+		}
+	}
+	return false
+}
+
+// installSIPShim handles macOS SIP-protected binaries by placing both the shim
+// and a backup symlink in /usr/local/bin, which is writable and has PATH priority.
+// The backup symlink points at the original SIP-protected binary so the shim can
+// exec it without a file copy.
+func installSIPShim(shieldBin, realPath string) (string, error) {
+	const localBin = "/usr/local/bin"
+
+	base := filepath.Base(realPath)
+	shimPath := filepath.Join(localBin, base)
+	backupPath := filepath.Join(localBin, "."+stripExtension(base)+backupSuffix)
+
+	// Remove any stale shim/backup from a previous install attempt
+	os.Remove(shimPath)
+	os.Remove(backupPath)
+
+	// Create a symlink-backup that points at the SIP-protected original
+	if err := os.Symlink(realPath, backupPath); err != nil {
+		return "", fmt.Errorf("failed to create SIP backup symlink %s → %s: %w", backupPath, realPath, err)
+	}
+
+	// Place the shield shim
+	if err := placeShim(shieldBin, shimPath); err != nil {
+		os.Remove(backupPath)
+		return "", fmt.Errorf("failed to place SIP shim at %s: %w", shimPath, err)
+	}
+
+	return shimPath, nil
 }
 
 // WrapperDir is defined in pathwrap.go (kept for backward compatibility)
