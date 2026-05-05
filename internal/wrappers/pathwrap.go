@@ -3,6 +3,7 @@ package wrappers
 import (
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -22,6 +23,12 @@ var WrappedCommands = []string{
 func WrapperDir() string {
 	home, _ := os.UserHomeDir()
 	return WrapperDirForHome(home)
+}
+
+// ResolveRealBinary returns the underlying executable path for a wrapped
+// command, skipping the wrapper directory itself.
+func ResolveRealBinary(cmd string) string {
+	return resolveRealBinary(cmd, WrapperDir())
 }
 
 // WrapperDirForHome returns the wrapper directory for a specific user's home.
@@ -81,8 +88,7 @@ func createWrapper(dir, cmd string) error {
 		}
 	}
 
-	// Find the real binary location (skip our wrapper dir)
-	realBin := findRealBinary(cmd, dir)
+	realBin := resolveRealBinary(cmd, dir)
 	if realBin == "" {
 		return fmt.Errorf("real binary not found for: %s", cmd)
 	}
@@ -141,6 +147,32 @@ func createUnixWrapper(dir, cmd, shieldBin, realBin string) error {
 		ShieldBin: shieldBin,
 		RealBin:   realBin,
 	})
+}
+
+func resolveRealBinary(cmd, skipDir string) string {
+	realBin := findRealBinary(cmd, skipDir)
+	if realBin == "" {
+		return ""
+	}
+
+	shieldBin, _ := os.Executable()
+	if shieldBin == "" || !isShimmed(realBin, shieldBin) {
+		return realBin
+	}
+
+	// If the found binary is our own shim, use the backed-up original instead.
+	// This avoids double-enforcement when both a shim and a wrapper exist.
+	base := filepath.Base(realBin)
+	backupName := "." + stripExtension(base) + backupSuffix
+	if ext := filepath.Ext(base); ext != "" {
+		backupName += ext
+	}
+	backupPath := filepath.Join(filepath.Dir(realBin), backupName)
+	if _, err := os.Stat(backupPath); err == nil {
+		return backupPath
+	}
+
+	return realBin
 }
 
 func createWindowsWrapper(dir, cmd, shieldBin, realBin string) error {
@@ -209,4 +241,65 @@ func samePath(a, b string) bool {
 		return strings.EqualFold(filepath.Clean(a), filepath.Clean(b))
 	}
 	return filepath.Clean(a) == filepath.Clean(b)
+}
+
+// AddToWindowsSystemPath adds dir to the front of the Windows system (Machine)
+// PATH. If that fails (insufficient UAC elevation), it falls back to the user
+// PATH which still helps when the stray binary is in a user-level PATH entry.
+// No-op on non-Windows.
+func AddToWindowsSystemPath(dir string) error {
+	if runtime.GOOS != "windows" {
+		return nil
+	}
+	dir = filepath.Clean(dir)
+	escaped := strings.ReplaceAll(dir, "'", "''")
+
+	sysScript := fmt.Sprintf(
+		`$d = '%s'; `+
+			`$sys = [Environment]::GetEnvironmentVariable('Path','Machine'); `+
+			`$parts = $sys -split ';' | Where-Object { $_ -ne '' }; `+
+			`if ($parts -notcontains $d) { `+
+			`[Environment]::SetEnvironmentVariable('Path', ($d+';'+$sys), 'Machine') }`,
+		escaped,
+	)
+	out, err := exec.Command("powershell.exe", "-NoProfile", "-NonInteractive", "-Command", sysScript).CombinedOutput()
+	if err == nil {
+		return nil
+	}
+	// Machine PATH requires a fully-elevated token; fall back to user PATH.
+	_ = out
+	userScript := fmt.Sprintf(
+		`$d = '%s'; `+
+			`$cur = [Environment]::GetEnvironmentVariable('Path','User'); `+
+			`$parts = $cur -split ';' | Where-Object { $_ -ne '' }; `+
+			`if ($parts -notcontains $d) { `+
+			`[Environment]::SetEnvironmentVariable('Path', ($d+';'+$cur), 'User') }`,
+		escaped,
+	)
+	out2, err2 := exec.Command("powershell.exe", "-NoProfile", "-NonInteractive", "-Command", userScript).CombinedOutput()
+	if err2 != nil {
+		return fmt.Errorf("failed to update PATH (system and user): %w: %s", err2, strings.TrimSpace(string(out2)))
+	}
+	return fmt.Errorf("system PATH requires full UAC elevation — added to user PATH instead (re-run from an elevated prompt to fix)")
+}
+
+// AddToWindowsUserPath adds dir to the Windows user-level PATH.
+// Kept for backward compatibility; prefer AddToWindowsSystemPath during admin installs.
+func AddToWindowsUserPath(dir string) error {
+	if runtime.GOOS != "windows" {
+		return nil
+	}
+	dir = filepath.Clean(dir)
+	script := fmt.Sprintf(
+		`$d = '%s'; $cur = [Environment]::GetEnvironmentVariable('Path','User'); `+
+			`$parts = $cur -split ';' | Where-Object { $_ -ne '' }; `+
+			`if ($parts -notcontains $d) { `+
+			`[Environment]::SetEnvironmentVariable('Path', ($d + ';' + $cur), 'User') }`,
+		strings.ReplaceAll(dir, "'", "''"),
+	)
+	out, err := exec.Command("powershell.exe", "-NoProfile", "-NonInteractive", "-Command", script).CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("failed to update Windows user PATH: %w: %s", err, strings.TrimSpace(string(out)))
+	}
+	return nil
 }

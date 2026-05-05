@@ -11,16 +11,19 @@
 // when the user approves an action, then re-apply it.
 //
 // Human workflow:
-//   authsec-shield pause 1h   → removes DENY ACLs, human can write freely
-//   authsec-shield enable     → re-applies DENY ACLs
+//
+//	authsec-shield pause 1h   → removes DENY ACLs, human can write freely
+//	authsec-shield enable     → re-applies DENY ACLs
 package fsprotect
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"time"
 )
 
 // ProtectPath sets a DENY write/delete ACL on the given path for the current user.
@@ -62,22 +65,20 @@ func ProtectPath(path string) error {
 
 	denyFlags := "(OI)(CI)(WD,AD,WA,WEA,DC,DE)"
 
+	// Use 30-second timeout to prevent hanging on large directories
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
 	// Deny for the specific user account
-	cmd1 := exec.Command("icacls", abs,
+	cmd1 := exec.CommandContext(ctx, "icacls", abs,
 		"/deny", fmt.Sprintf("%s:%s", username, denyFlags),
-		"/T", "/C", "/Q",
+		"/C", "/Q",
 	)
 	if output, err := cmd1.CombinedOutput(); err != nil {
+		if ctx.Err() == context.DeadlineExceeded {
+			return fmt.Errorf("icacls timed out on %s (directory too large?)", abs)
+		}
 		return fmt.Errorf("icacls deny user failed: %s — %w", strings.TrimSpace(string(output)), err)
-	}
-
-	// Deny for BUILTIN\Administrators to block elevated token bypass
-	cmd2 := exec.Command("icacls", abs,
-		"/deny", fmt.Sprintf("BUILTIN\\Administrators:%s", denyFlags),
-		"/T", "/C", "/Q",
-	)
-	if output, err := cmd2.CombinedOutput(); err != nil {
-		return fmt.Errorf("icacls deny admins failed: %s — %w", strings.TrimSpace(string(output)), err)
 	}
 
 	return nil
@@ -96,22 +97,21 @@ func UnprotectPath(path string) error {
 		return fmt.Errorf("failed to get current user: %w", err)
 	}
 
-	// Remove deny ACEs for both user and Administrators group
-	cmd1 := exec.Command("icacls", abs,
-		"/remove:d", username,
-		"/T", "/C", "/Q",
-	)
-	if output, err := cmd1.CombinedOutput(); err != nil {
-		return fmt.Errorf("icacls remove deny user failed: %s — %w", strings.TrimSpace(string(output)), err)
-	}
+	// Remove deny ACEs — no /T recursive, just the directory itself
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
 
-	cmd2 := exec.Command("icacls", abs,
-		"/remove:d", "BUILTIN\\Administrators",
-		"/T", "/C", "/Q",
+	cmd1 := exec.CommandContext(ctx, "icacls", abs,
+		"/remove:d", username,
+		"/C", "/Q",
 	)
-	if output, err := cmd2.CombinedOutput(); err != nil {
-		return fmt.Errorf("icacls remove deny admins failed: %s — %w", strings.TrimSpace(string(output)), err)
-	}
+	cmd1.Run() // ignore errors — ACE may not exist
+
+	cmd2 := exec.CommandContext(ctx, "icacls", abs,
+		"/remove:d", "BUILTIN\\Administrators",
+		"/C", "/Q",
+	)
+	cmd2.Run() // ignore errors
 
 	return nil
 }

@@ -1,8 +1,9 @@
 // AuthSec Agent Shield — persistent background daemon
 //
 // This binary runs as:
-//   Linux:   a systemd service (authsec-shield-daemon.service)
-//   Windows: a Windows Service (AuthSecShieldDaemon)
+//
+//	Linux:   a systemd service (authsec-shield-daemon.service)
+//	Windows: a Windows Service (AuthSecShieldDaemon)
 //
 // It is the control plane for all shield subsystems:
 //   - Starts/stops kernel exec monitor (fanotify + eBPF on Linux, minifilter on Windows)
@@ -17,11 +18,13 @@
 // and the shell-hook / shim layers.
 //
 // Usage:
-//   authsec-shield-daemon [--config /path/to/config.json]
+//
+//	authsec-shield-daemon [--config /path/to/config.json]
 //
 // Install:
-//   Linux:   sudo make -C kernel/linux/execmon install && sudo systemctl enable --now authsec-shield-daemon
-//   Windows: authsec-shield-daemon.exe install  (registers Windows Service)
+//
+//	Linux:   sudo make -C kernel/linux/execmon install && sudo systemctl enable --now authsec-shield-daemon
+//	Windows: authsec-shield-daemon.exe install  (registers Windows Service)
 package main
 
 import (

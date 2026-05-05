@@ -20,6 +20,12 @@ type DeviceCodeResponse struct {
 	Interval        int    `json:"interval"`
 }
 
+// AuthURLResponse is returned by /oidc/auth-url
+type AuthURLResponse struct {
+	AuthURL string `json:"auth_url"`
+	State   string `json:"state"`
+}
+
 // TokenResponse is returned when device code is exchanged for tokens
 type TokenResponse struct {
 	AccessToken  string `json:"access_token"`
@@ -37,61 +43,43 @@ type TokenResponse struct {
 
 // Client handles AuthSec authentication
 type Client struct {
-	baseURL    string
+	baseURL  string
+	clientID string
 	httpClient *http.Client
 }
 
 // NewClient creates a new auth client
 func NewClient(cfg *config.Config) *Client {
 	return &Client{
-		baseURL: cfg.AuthSecBaseURL,
+		baseURL:  cfg.AuthSecBaseURL,
+		clientID: cfg.ClientID,
 		httpClient: &http.Client{
 			Timeout: 30 * time.Second,
 		},
 	}
 }
 
-// InitiateDeviceLogin starts the device code flow (RFC 8628).
-// No client_id or tenant config required — server resolves tenant from
-// the user's browser session when they enter the code.
-func (c *Client) InitiateDeviceLogin() (*DeviceCodeResponse, error) {
-	payload := map[string]interface{}{
-		"scopes": []string{"openid", "email", "profile"},
-	}
-
-	body, err := json.Marshal(payload)
+// InitiateLogin performs step 1+2:
+// 1. Get device code (user_code for the user to enter after auth)
+// 2. Get auth URL using client_id (OIDC login link)
+// Returns both so the shield can show: "Open: [auth_url], Code: [user_code]"
+func (c *Client) InitiateLogin() (*DeviceCodeResponse, *AuthURLResponse, error) {
+	// Step 1: Get device code
+	deviceResp, err := c.requestDeviceCode()
 	if err != nil {
-		return nil, fmt.Errorf("failed to marshal request: %w", err)
+		return nil, nil, fmt.Errorf("failed to get device code: %w", err)
 	}
 
-	resp, err := c.httpClient.Post(
-		c.baseURL+"/authsec/uflow/auth/device/code",
-		"application/json",
-		bytes.NewBuffer(body),
-	)
+	// Step 2: Get auth URL
+	authResp, err := c.getAuthURL()
 	if err != nil {
-		return nil, fmt.Errorf("failed to initiate device login: %w", err)
-	}
-	defer resp.Body.Close()
-
-	respBody, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, fmt.Errorf("failed to read response: %w", err)
+		return deviceResp, nil, fmt.Errorf("failed to get auth URL: %w", err)
 	}
 
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("device login failed (HTTP %d): %s", resp.StatusCode, string(respBody))
-	}
-
-	var result DeviceCodeResponse
-	if err := json.Unmarshal(respBody, &result); err != nil {
-		return nil, fmt.Errorf("failed to parse response: %w", err)
-	}
-
-	return &result, nil
+	return deviceResp, authResp, nil
 }
 
-// PollForToken polls the token endpoint until the user completes authentication
+// PollForToken polls the device token endpoint until the user completes authentication
 func (c *Client) PollForToken(deviceCode string, interval, expiresIn int) (*TokenResponse, error) {
 	if interval < 1 {
 		interval = 5
@@ -129,34 +117,93 @@ func (c *Client) PollForToken(deviceCode string, interval, expiresIn int) (*Toke
 			continue
 		}
 
-		// Still waiting
 		if result.Error == "authorization_pending" {
 			continue
 		}
-
-		// Server asking us to back off — increase interval and keep polling
 		if result.Error == "slow_down" {
 			interval += 5
 			continue
 		}
-
-		// Expired
 		if result.Error == "expired_token" {
 			return nil, fmt.Errorf("login expired — user did not authenticate in time")
 		}
-
-		// Error
 		if result.Error != "" {
 			return nil, fmt.Errorf("login failed: %s — %s", result.Error, result.ErrorDesc)
 		}
-
-		// Success
 		if result.AccessToken != "" {
 			return &result, nil
 		}
 	}
 
 	return nil, fmt.Errorf("login timed out")
+}
+
+// requestDeviceCode calls POST /auth/device/code
+func (c *Client) requestDeviceCode() (*DeviceCodeResponse, error) {
+	payload := map[string]interface{}{
+		"scopes": []string{"openid", "email", "profile"},
+	}
+
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return nil, err
+	}
+
+	resp, err := c.httpClient.Post(
+		c.baseURL+"/authsec/uflow/auth/device/code",
+		"application/json",
+		bytes.NewBuffer(body),
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	respBody, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(respBody))
+	}
+
+	var result DeviceCodeResponse
+	if err := json.Unmarshal(respBody, &result); err != nil {
+		return nil, err
+	}
+
+	return &result, nil
+}
+
+// getAuthURL calls POST /oidc/auth-url with client_id
+func (c *Client) getAuthURL() (*AuthURLResponse, error) {
+	payload := map[string]string{
+		"client_id": c.clientID,
+	}
+
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return nil, err
+	}
+
+	resp, err := c.httpClient.Post(
+		c.baseURL+"/authsec/uflow/oidc/auth-url",
+		"application/json",
+		bytes.NewBuffer(body),
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	respBody, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(respBody))
+	}
+
+	var result AuthURLResponse
+	if err := json.Unmarshal(respBody, &result); err != nil {
+		return nil, err
+	}
+
+	return &result, nil
 }
 
 // Logout clears stored credentials

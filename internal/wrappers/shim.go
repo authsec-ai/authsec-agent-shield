@@ -15,6 +15,7 @@ package wrappers
 import (
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -34,8 +35,10 @@ var ShimmedCommands = []string{
 	"docker", "kubectl", "helm", "terraform",
 	// Cloud CLIs
 	"aws", "gcloud", "az",
-	// Git (the binary itself — catches all git subcommands)
-	"git",
+	// NOTE: git is NOT shimmed — it self-calls internally hundreds of times
+	// causing fork bombs. Git is protected via shell hooks + PATH wrappers instead.
+	// Database CLIs
+	"mysql", "psql", "mongosh", "sqlcmd", "redis-cli", "sqlite3",
 }
 
 // ShimStatus describes the state of a single command shim
@@ -49,6 +52,8 @@ type ShimStatus struct {
 }
 
 // InstallShims replaces real binaries with shield shims.
+// It shims ALL occurrences of each command found in PATH so that stray copies
+// earlier in PATH (e.g. ~/kubectl.exe) cannot bypass the shield.
 // Requires elevated privileges (sudo/admin).
 func InstallShims(shieldBin string) ([]ShimStatus, error) {
 	if shieldBin == "" {
@@ -63,64 +68,76 @@ func InstallShims(shieldBin string) ([]ShimStatus, error) {
 	var results []ShimStatus
 
 	for _, cmd := range ShimmedCommands {
-		status := ShimStatus{Command: cmd}
-
-		// Find the real binary
-		realPath := findSystemBinary(cmd)
-		if realPath == "" {
-			status.Error = "not found on system"
-			results = append(results, status)
+		// Find ALL occurrences of this binary in PATH so every copy gets shimmed.
+		// A stray binary earlier in PATH (e.g. C:\Users\foo\kubectl.exe) would
+		// otherwise bypass the shield installed at the canonical system location.
+		allPaths := findAllSystemBinaries(cmd)
+		if len(allPaths) == 0 {
+			results = append(results, ShimStatus{Command: cmd, Error: "not found on system"})
 			continue
 		}
-		status.RealPath = realPath
 
-		// Compute backup path
-		dir := filepath.Dir(realPath)
-		base := filepath.Base(realPath)
-		backupName := "." + stripExtension(base) + backupSuffix
-		if ext := filepath.Ext(base); ext != "" {
-			backupName += ext
-		}
-		status.BackupPath = filepath.Join(dir, backupName)
-		status.ShimPath = realPath
+		for _, realPath := range allPaths {
+			status := ShimStatus{Command: cmd, RealPath: realPath, ShimPath: realPath}
 
-		// Check if already shimmed
-		if isShimmed(realPath, shieldBin) {
+			dir := filepath.Dir(realPath)
+			base := filepath.Base(realPath)
+			backupName := "." + stripExtension(base) + backupSuffix
+			if ext := filepath.Ext(base); ext != "" {
+				backupName += ext
+			}
+			status.BackupPath = filepath.Join(dir, backupName)
+
+			if isShimmed(realPath, shieldBin) {
+				status.Installed = true
+				results = append(results, status)
+				continue
+			}
+
+			if _, err := os.Stat(status.BackupPath); err == nil {
+				if err := placeShim(shieldBin, realPath); err != nil {
+					status.Error = fmt.Sprintf("failed to place shim: %v", err)
+				} else {
+					status.Installed = true
+				}
+				results = append(results, status)
+				continue
+			}
+
+			if runtime.GOOS == "windows" {
+				takeOwnership(realPath)
+				takeOwnership(filepath.Dir(realPath))
+			}
+
+			if err := os.Rename(realPath, status.BackupPath); err != nil {
+				// On macOS, SIP-protected directories (/bin, /usr/bin, etc.) reject renames
+				// even with sudo. Fall back to placing a shim in /usr/local/bin instead,
+				// which has PATH priority on macOS and is writable.
+				if isSIPProtectedPath(realPath) {
+					shimPath, sipErr := installSIPShim(shieldBin, realPath)
+					if sipErr == nil {
+						status.ShimPath = shimPath
+						status.BackupPath = filepath.Join(filepath.Dir(shimPath), "."+stripExtension(filepath.Base(realPath))+backupSuffix)
+						status.Installed = true
+						results = append(results, status)
+						continue
+					}
+				}
+				status.Error = fmt.Sprintf("failed to backup original (need sudo/admin?): %v", err)
+				results = append(results, status)
+				continue
+			}
+
+			if err := placeShim(shieldBin, realPath); err != nil {
+				os.Rename(status.BackupPath, realPath)
+				status.Error = fmt.Sprintf("failed to place shim: %v", err)
+				results = append(results, status)
+				continue
+			}
+
 			status.Installed = true
 			results = append(results, status)
-			continue
 		}
-
-		// Check if backup already exists (previous partial install)
-		if _, err := os.Stat(status.BackupPath); err == nil {
-			// Backup exists — the real binary is already moved, just need to place shim
-			if err := placeShim(shieldBin, realPath); err != nil {
-				status.Error = fmt.Sprintf("failed to place shim: %v", err)
-			} else {
-				status.Installed = true
-			}
-			results = append(results, status)
-			continue
-		}
-
-		// Move real binary to backup
-		if err := os.Rename(realPath, status.BackupPath); err != nil {
-			status.Error = fmt.Sprintf("failed to backup original (need sudo/admin?): %v", err)
-			results = append(results, status)
-			continue
-		}
-
-		// Place shim at original location
-		if err := placeShim(shieldBin, realPath); err != nil {
-			// Rollback: move backup back
-			os.Rename(status.BackupPath, realPath)
-			status.Error = fmt.Sprintf("failed to place shim: %v", err)
-			results = append(results, status)
-			continue
-		}
-
-		status.Installed = true
-		results = append(results, status)
 	}
 
 	return results, nil
@@ -154,6 +171,16 @@ func UninstallShims() ([]ShimStatus, error) {
 
 		if _, err := os.Stat(backupPath); os.IsNotExist(err) {
 			status.Error = "no backup found (not shimmed?)"
+			results = append(results, status)
+			continue
+		}
+
+		// SIP shim detection: backup is a symlink (points at the SIP-protected original).
+		// In this case just remove both files — nothing was moved from the protected dir.
+		if backupInfo, lErr := os.Lstat(backupPath); lErr == nil && backupInfo.Mode()&os.ModeSymlink != 0 {
+			os.Remove(realPath)
+			os.Remove(backupPath)
+			status.Installed = false
 			results = append(results, status)
 			continue
 		}
@@ -253,48 +280,46 @@ func IsShimInvocation() (bool, string) {
 	return false, ""
 }
 
-// DiagnoseShims reports the status of all shims
+// DiagnoseShims reports the status of all shims, checking every occurrence of
+// each command in PATH so stray unshimmed copies are surfaced as issues.
 func DiagnoseShims() []ShimStatus {
 	var results []ShimStatus
 
 	shieldBin, _ := os.Executable()
 
 	for _, cmd := range ShimmedCommands {
-		status := ShimStatus{Command: cmd}
-
-		realPath := findSystemBinary(cmd)
-		if realPath == "" {
-			status.Error = "not found on system"
-			results = append(results, status)
+		allPaths := findAllSystemBinaries(cmd)
+		if len(allPaths) == 0 {
+			results = append(results, ShimStatus{Command: cmd, Error: "not found on system"})
 			continue
 		}
 
-		status.RealPath = realPath
-		status.ShimPath = realPath
+		for _, realPath := range allPaths {
+			status := ShimStatus{Command: cmd, RealPath: realPath, ShimPath: realPath}
 
-		dir := filepath.Dir(realPath)
-		base := filepath.Base(realPath)
-		backupName := "." + stripExtension(base) + backupSuffix
-		if ext := filepath.Ext(base); ext != "" {
-			backupName += ext
-		}
-		status.BackupPath = filepath.Join(dir, backupName)
-
-		if _, err := os.Stat(status.BackupPath); err == nil {
-			// Backup exists, check if current binary is the shim
-			if isShimmed(realPath, shieldBin) {
-				status.Installed = true
-			} else {
-				status.Error = "backup exists but shim not in place"
+			dir := filepath.Dir(realPath)
+			base := filepath.Base(realPath)
+			backupName := "." + stripExtension(base) + backupSuffix
+			if ext := filepath.Ext(base); ext != "" {
+				backupName += ext
 			}
-		} else if isShimmed(realPath, shieldBin) {
-			status.Installed = true
-			status.Error = "shim in place but backup missing"
-		} else {
-			status.Error = "not shimmed"
-		}
+			status.BackupPath = filepath.Join(dir, backupName)
 
-		results = append(results, status)
+			if _, err := os.Stat(status.BackupPath); err == nil {
+				if isShimmed(realPath, shieldBin) {
+					status.Installed = true
+				} else {
+					status.Error = "backup exists but shim not in place"
+				}
+			} else if isShimmed(realPath, shieldBin) {
+				status.Installed = true
+				status.Error = "shim in place but backup missing"
+			} else {
+				status.Error = "not shimmed"
+			}
+
+			results = append(results, status)
+		}
 	}
 
 	return results
@@ -419,7 +444,39 @@ func placeShim(shieldBin, targetPath string) error {
 
 	perm := os.FileMode(0755)
 	if err := os.WriteFile(targetPath, src, perm); err != nil {
+		// On Windows, Program Files may need takeown + icacls grant first
+		if runtime.GOOS == "windows" {
+			if takeErr := takeOwnership(targetPath); takeErr == nil {
+				if err2 := os.WriteFile(targetPath, src, perm); err2 == nil {
+					return nil
+				}
+			}
+		}
 		return fmt.Errorf("failed to write shim: %w", err)
+	}
+
+	return nil
+}
+
+// takeOwnership takes ownership of a file/path and grants full control.
+// Needed on Windows to write to Program Files.
+// Uses cmd.exe /C to avoid MSYS2/Git Bash path mangling.
+func takeOwnership(path string) error {
+	// Ensure we have a clean Windows path (not a MSYS2 converted one)
+	absPath, _ := filepath.Abs(path)
+
+	// takeown /f <path>
+	cmd1 := exec.Command("cmd.exe", "/C", "takeown", "/f", absPath)
+	cmd1.Env = append(os.Environ(), "MSYS_NO_PATHCONV=1")
+	if _, err := cmd1.CombinedOutput(); err != nil {
+		return err
+	}
+
+	// icacls <path> /grant Administrators:F
+	cmd2 := exec.Command("cmd.exe", "/C", "icacls", absPath, "/grant", "Administrators:F")
+	cmd2.Env = append(os.Environ(), "MSYS_NO_PATHCONV=1")
+	if _, err := cmd2.CombinedOutput(); err != nil {
+		return err
 	}
 
 	return nil
@@ -446,6 +503,55 @@ func isShimmed(path, shieldBin string) bool {
 	}
 
 	return pathInfo.Size() == shieldInfo.Size()
+}
+
+// findAllSystemBinaries returns every occurrence of cmd found in PATH,
+// skipping the wrapper dir. This lets InstallShims shim all copies so a stray
+// binary earlier in PATH cannot bypass the shield.
+func findAllSystemBinaries(cmd string) []string {
+	wrapperDir := WrapperDir()
+
+	var searchPaths []string
+	if runtime.GOOS == "windows" {
+		searchPaths = strings.Split(os.Getenv("PATH"), ";")
+	} else {
+		searchPaths = []string{"/usr/bin", "/usr/local/bin", "/bin", "/sbin", "/usr/sbin"}
+		searchPaths = append(searchPaths, strings.Split(os.Getenv("PATH"), ":")...)
+	}
+
+	var results []string
+	seen := make(map[string]bool)
+
+	for _, dir := range searchPaths {
+		dir = strings.TrimSpace(dir)
+		if dir == "" || samePath(dir, wrapperDir) {
+			continue
+		}
+
+		var candidates []string
+		if runtime.GOOS == "windows" {
+			candidates = []string{
+				filepath.Join(dir, cmd+".exe"),
+				filepath.Join(dir, cmd+".cmd"),
+				filepath.Join(dir, cmd+".bat"),
+			}
+		} else {
+			candidates = []string{filepath.Join(dir, cmd)}
+		}
+
+		for _, c := range candidates {
+			absC := strings.ToLower(filepath.Clean(c))
+			if seen[absC] {
+				continue
+			}
+			if info, err := os.Stat(c); err == nil && !info.IsDir() {
+				results = append(results, c)
+				seen[absC] = true
+				break
+			}
+		}
+	}
+	return results
 }
 
 // findSystemBinary finds a binary in standard system paths (not our wrapper dir)
@@ -517,6 +623,51 @@ func stripExtension(name string) string {
 		return strings.TrimSuffix(name, ext)
 	}
 	return name
+}
+
+// isSIPProtectedPath returns true if the path lives inside a macOS SIP-protected
+// directory. These directories reject writes even under sudo.
+func isSIPProtectedPath(path string) bool {
+	if runtime.GOOS != "darwin" {
+		return false
+	}
+	sipDirs := []string{"/bin", "/sbin", "/usr/bin", "/usr/sbin", "/System"}
+	clean := filepath.Clean(path)
+	for _, d := range sipDirs {
+		if strings.HasPrefix(clean, d+string(filepath.Separator)) || clean == d {
+			return true
+		}
+	}
+	return false
+}
+
+// installSIPShim handles macOS SIP-protected binaries by placing both the shim
+// and a backup symlink in /usr/local/bin, which is writable and has PATH priority.
+// The backup symlink points at the original SIP-protected binary so the shim can
+// exec it without a file copy.
+func installSIPShim(shieldBin, realPath string) (string, error) {
+	const localBin = "/usr/local/bin"
+
+	base := filepath.Base(realPath)
+	shimPath := filepath.Join(localBin, base)
+	backupPath := filepath.Join(localBin, "."+stripExtension(base)+backupSuffix)
+
+	// Remove any stale shim/backup from a previous install attempt
+	os.Remove(shimPath)
+	os.Remove(backupPath)
+
+	// Create a symlink-backup that points at the SIP-protected original
+	if err := os.Symlink(realPath, backupPath); err != nil {
+		return "", fmt.Errorf("failed to create SIP backup symlink %s → %s: %w", backupPath, realPath, err)
+	}
+
+	// Place the shield shim
+	if err := placeShim(shieldBin, shimPath); err != nil {
+		os.Remove(backupPath)
+		return "", fmt.Errorf("failed to place SIP shim at %s: %w", shimPath, err)
+	}
+
+	return shimPath, nil
 }
 
 // WrapperDir is defined in pathwrap.go (kept for backward compatibility)

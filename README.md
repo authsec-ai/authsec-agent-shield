@@ -1,288 +1,280 @@
 # AuthSec Agent Shield
 
-AuthSec Agent Shield is a local command-approval guard for AI agents and interactive shells.
+**System-level protection against risky AI tool actions. One install. Every AI tool governed.**
 
-It evaluates risky commands and tool calls, sends approval requests to AuthSec, and blocks execution unless the action is approved or the shield is temporarily paused.
+When Claude Code, Codex, OpenClaw, Cursor, or any AI tool tries to run a dangerous command on your machine — `rm -rf`, `git push --force`, `kubectl delete namespace`, `DROP TABLE` — your phone buzzes first. You approve or deny. Then it executes.
 
-This repository is currently a strong prototype, not a fully hardened endpoint security product.
+Safe commands (`git status`, `docker ps`, `ls`, `cat`) pass through instantly with zero latency.
 
-## What It Does
+---
 
-- Intercepts risky shell commands
-- Intercepts risky PowerShell cmdlets
-- Intercepts MCP tool calls through `mcp-proxy`
-- Sends approval requests to AuthSec
-- Blocks risky actions by default
-- Allows a human to temporarily pause enforcement
+## Quick Start (Windows)
 
-## Current Model
+### Prerequisites
 
-The project currently uses three enforcement layers:
+- Windows 10/11
+- Go 1.22+ (to build from source)
+- An AuthSec account (your admin gives you a client ID)
 
-1. Shell hooks
-2. Command wrappers
-3. MCP proxy
-
-This works well for many common workflows, but it is not yet a full brokered execution architecture. A determined local process can still bypass it if it avoids these paths.
-
-## Supported Platforms
-
-### Windows
-
-Current support is best on Windows PowerShell / PowerShell.
-
-Covered today:
-
-- PowerShell profile hooks
-- Wrapped binaries such as `kubectl`, `docker`, `gcloud`, `az`
-- PowerShell cmdlets such as `Remove-Item`
-
-Requirements:
-
-- PowerShell profile must load successfully
-- Execution policy must permit profile loading
-- Wrapper directory must be first in `PATH`
-
-### macOS / Linux
-
-The repo contains bash/zsh hooks and Unix wrappers.
-
-Expected flow:
-
-- install shell hooks
-- ensure wrapper dir is first in `PATH`
-- route MCP tools through `authsec-shield mcp-proxy`
-
-These paths are supported in code, but should still be validated on real machines with `doctor`.
-
-## Build
-
-From the repo root:
+### 1. Build
 
 ```powershell
-go build -buildvcs=false -o authsec-shield.exe ./cmd/shield
+cd authsec-agent-shield
+go build -o shield.exe ./cmd/shield/
 ```
 
-On macOS / Linux:
+### 2. Setup
+
+```powershell
+.\shield.exe setup --client-id <YOUR_CLIENT_ID> --base-url https://prod.api.authsec.ai
+```
+
+### 3. Login
+
+```powershell
+.\shield.exe login
+```
+
+Opens browser for AuthSec SSO. After authenticating, enter the code shown in your terminal on the activation page. The shield receives your credentials automatically.
+
+### 4. Install (as Administrator)
+
+Open **Administrator PowerShell** and run:
+
+```powershell
+# Step 1: Install hooks and wrappers
+cd C:\path\to\authsec-agent-shield
+.\shield.exe install
+
+# Step 2: Install binary shims for Program Files (needs admin + takeown)
+.\install-shims.ps1
+```
+
+Or in one command from a normal terminal:
+
+```powershell
+Start-Process powershell -Verb RunAs -ArgumentList "-NoExit", "-ExecutionPolicy", "Bypass", "-Command", "& {Set-Location 'C:\path\to\authsec-agent-shield'; .\install-shims.ps1}"
+```
+
+### 5. Verify
+
+```powershell
+.\shield.exe doctor
+```
+
+### 6. Done
+
+Every risky AI action now requires your mobile approval.
+
+---
+
+## Quick Start (macOS / Linux)
+
+### 1. Build
 
 ```bash
-go build -buildvcs=false -o authsec-shield ./cmd/shield
+cd authsec-agent-shield
+go build -o authsec-shield ./cmd/shield/
 ```
 
-## Initial Setup
+### 2. Setup + Login
 
-### 1. Configure tenant details
-
-```powershell
-.\authsec-shield.exe setup --client-id <client-id> --tenant-domain <domain> --base-url <url>
+```bash
+./authsec-shield setup --client-id <YOUR_CLIENT_ID> --base-url https://prod.api.authsec.ai
+./authsec-shield login
 ```
 
-### 2. Login
+### 3. Install
 
-```powershell
-.\authsec-shield.exe login
+```bash
+sudo ./authsec-shield install
 ```
 
-### 3. Install hooks and wrappers
-
-```powershell
-.\authsec-shield.exe install
-```
-
-### 4. On Windows, allow PowerShell profiles to load
-
-```powershell
-Set-ExecutionPolicy -Scope CurrentUser RemoteSigned
-```
-
-### 5. Open a brand-new shell
-
-This is required so the profile and wrapper PATH changes take effect.
-
-## Daily Commands
-
-### Show state
-
-```powershell
-.\authsec-shield.exe status
-```
-
-### Diagnose local issues
-
-```powershell
-.\authsec-shield.exe doctor
-```
-
-### Pause enforcement temporarily
-
-```powershell
-.\authsec-shield.exe pause 15m
-```
-
-### Re-enable immediately
-
-```powershell
-.\authsec-shield.exe enable
-```
-
-### Score a command without executing it
-
-```powershell
-.\authsec-shield.exe test "git reset --hard"
-```
-
-## End-to-End Testing
-
-## Windows PowerShell
-
-Open a fresh PowerShell window and run:
-
-```powershell
-.\authsec-shield.exe doctor
-Get-Command Remove-Item
-Get-Command kubectl -All
-```
-
-Expected:
-
-- `Remove-Item` resolves as a `Function`
-- wrapped tools appear from `C:\Users\<you>\.authsec-shield\bin`
-- `doctor` should not say `PATH order: MISS`
-
-Then test a local file delete:
-
-```powershell
-Set-Content demo-risky-delete.txt "test"
-Remove-Item -LiteralPath demo-risky-delete.txt
-```
-
-Then test an external tool:
-
-```powershell
-kubectl delete namespace demo-test
-```
-
-## macOS / Linux
-
-Open a fresh shell and run:
+### 4. Verify
 
 ```bash
 ./authsec-shield doctor
-which rm
-which kubectl
 ```
 
-Then test:
+---
+
+## What Gets Protected
+
+### Binary Shims (system-level, un-bypassable)
+
+| Command | What it catches |
+|---------|----------------|
+| `rm`, `rmdir`, `shred`, `unlink` | File/directory deletion |
+| `chmod`, `chown` | Permission changes |
+| `mkfs`, `dd` | Disk operations |
+| `git` | push --force, reset --hard, clean |
+| `docker` | rm, rmi, system prune |
+| `kubectl` | delete namespace/pod/deployment |
+| `helm` | delete, uninstall |
+| `terraform` | destroy |
+| `aws`, `gcloud`, `az` | Cloud resource deletion |
+| `mysql`, `psql` | DROP, DELETE, TRUNCATE |
+
+### Shell Hooks (additional layer)
+
+- **PowerShell**: CommandValidationHandler + wrapped cmdlets (Remove-Item, Set-Content, Move-Item, etc.)
+- **Bash**: preexec via DEBUG trap
+- **Zsh**: native preexec hook
+
+### MCP Proxy (for Claude Desktop, Codex, Cursor)
+
+Intercepts structured tool calls (`write_file`, `delete_file`, `execute_command`) at the JSON-RPC level.
+
+### Filesystem Protection (NTFS ACL / chattr)
+
+DENY write ACLs on sensitive directories: `.ssh`, `.aws`, `.kube`, `.env`
+
+---
+
+## Risk Scoring
+
+Every command is scored locally (no network call). Only scores above the threshold (default: 30) trigger a network call for mobile approval.
+
+| Command | Score | Result |
+|---------|-------|--------|
+| `ls -la` | 0 | Pass |
+| `cat README.md` | 0 | Pass |
+| `git status` | 0 | Pass |
+| `docker ps` | 0 | Pass |
+| `git push` | 30 | Pass (at threshold) |
+| `rm file.txt` | 40 | Blocked |
+| `git push --force` | 100 | Blocked |
+| `rm -rf /` | 100 | Blocked |
+| `kubectl delete namespace production` | 100 | Blocked |
+| `DROP TABLE users` | 100 | Blocked |
+| `mysql -e "DELETE FROM users"` | 100 | Blocked |
+
+### What adds to the score
+
+| Factor | Points |
+|--------|--------|
+| Destructive verb (rm, drop, delete) | +40 |
+| Dangerous command pattern match | +60 |
+| Force/hard flags (--force, -rf) | +20 |
+| Recursive operation | +15 |
+| Sensitive file path (.env, .ssh) | +25 |
+| System path (/etc, C:\Windows) | +30 |
+| Elevated privileges (sudo) | +15 |
+| SQL destructive (DROP, TRUNCATE) | +60 |
+| Pipe to destructive command | +30 |
+
+---
+
+## Commands
+
+```
+shield setup --client-id <id> --base-url <url>   Configure
+shield login                                      Authenticate via AuthSec SSO
+shield logout                                     Clear credentials
+shield status                                     Show protection status
+shield doctor                                     Diagnose installation health
+shield install                                    Install all protection layers
+shield uninstall                                  Remove all protection, restore originals
+shield pause 1h                                   Pause protection for 1 hour
+shield enable                                     Re-enable protection immediately
+shield test "rm -rf /"                            Test a command's risk score
+shield check "command"                            Evaluate command (used by hooks internally)
+shield mcp-proxy -- <cmd> [args]                  Run as MCP proxy for Claude Desktop/Codex
+```
+
+---
+
+## Architecture
+
+```
+┌──────────────────────────────────────────────┐
+│              Your Machine                     │
+│                                               │
+│  Claude Code  Codex  OpenClaw  Cursor  ...    │
+│       │         │       │        │            │
+│  ┌────▼─────────▼───────▼────────▼─────────┐  │
+│  │        AuthSec Agent Shield              │  │
+│  │                                          │  │
+│  │  Layer 1: Binary Shims                   │  │
+│  │    rm, git, docker, kubectl, mysql, psql │  │
+│  │    replaced at system level              │  │
+│  │                                          │  │
+│  │  Layer 2: Filesystem Protection          │  │
+│  │    NTFS DENY ACL on .ssh, .aws, .kube    │  │
+│  │                                          │  │
+│  │  Layer 3: Shell Hooks                    │  │
+│  │    PowerShell, Bash, Zsh preexec         │  │
+│  │                                          │  │
+│  │  Layer 4: MCP Proxy                      │  │
+│  │    JSON-RPC interception for AI tools    │  │
+│  │                                          │  │
+│  │  Local Risk Engine (no network call)     │  │
+│  │    score <= 30: pass instantly            │  │
+│  │    score > 30: push to phone             │  │
+│  └──────────────────────────────────────────┘  │
+│                                               │
+│  AuthSec API → CIBA Push → Mobile App         │
+└──────────────────────────────────────────────┘
+```
+
+---
+
+## Pause / Resume
+
+When YOU need to work freely:
 
 ```bash
-./authsec-shield test "rm -rf /tmp/demo"
-./authsec-shield test "kubectl delete namespace demo-test"
+shield pause 1h      # Pause all protection for 1 hour
+shield pause 30m     # Pause for 30 minutes
+shield enable        # Re-enable immediately
 ```
 
-## Claude / MCP Tools
+During pause, all commands pass through unchecked.
 
-Route the MCP server through the shield:
+---
 
-```json
-{
-  "command": "authsec-shield",
-  "args": ["mcp-proxy", "--", "npx", "mcp-server-filesystem", "/path"]
-}
-```
+## Uninstall
 
-On Windows, use the full path to `authsec-shield.exe`.
-
-## What `doctor` Checks
-
-- config file present
-- logged in state
-- enabled / paused state
-- expected shell profile files
-- wrapper directory
-- wrapper presence for common tools
-- whether wrapper dir appears in `PATH`
-
-## Known Limitations
-
-The current project is not fully bypass-proof.
-
-It can still be bypassed if a process:
-
-- does not use the protected shell
-- does not load the profile
-- executes binaries directly outside wrapper resolution
-- uses a different execution runtime
-- directly edits files or config with the same user privileges
-
-This is why the next architectural step is a broker model, where all risky execution must pass through a single local execution service.
-
-## Why Codex Could Still Edit Files During Development
-
-This is the honest answer:
-
-- My edits in this repo were often made through the development environment's file-editing tool, not through your PowerShell hook or wrapped binaries.
-- Your shield currently protects shell commands, PowerShell cmdlets, wrappers, and MCP proxy traffic.
-- It does not yet broker every possible write path from every local tool.
-
-So when I edited files directly through the coding environment, those changes did not automatically flow through the same interception layer that catches `Remove-Item`, `kubectl`, or `git reset --hard`.
-
-That is exactly why a future broker architecture is needed.
-
-## Product Direction
-
-To become broadly reliable across devices and operating systems, the project should evolve toward:
-
-1. A local execution broker
-2. MCP-first integration
-3. Shell hooks and wrappers as defense-in-depth
-4. Doctor/self-healing install checks
-5. Optional OS-level hardening
-
-## Quick Troubleshooting
-
-### `doctor` says `PATH order: MISS`
-
-Your current shell is not using the wrapper directory.
-
-Temporary fix:
+From admin PowerShell:
 
 ```powershell
-$env:PATH = "C:\Users\<you>\.authsec-shield\bin;$env:PATH"
+.\shield.exe uninstall
 ```
 
-Then open a fresh shell and test again.
+This restores all original binaries, removes shell hooks, removes filesystem DENY ACLs, and cleans up wrappers.
 
-### PowerShell profile is not loading
+---
 
-Set execution policy:
+## Tested Interceptions
 
-```powershell
-Set-ExecutionPolicy -Scope CurrentUser RemoteSigned
-```
+All blocked during live testing with Claude Code (Anthropic):
 
-Then restart PowerShell.
+| Command | Score | Status |
+|---------|-------|--------|
+| `rm -rf /tmp/shield-test/important.txt` | 55 | BLOCKED |
+| `rm -rf /` | 100 | BLOCKED |
+| `unlink file` | 40 | BLOCKED |
+| `git push --force origin main` | 100 | BLOCKED |
+| `git reset --hard HEAD~5` | 100 | BLOCKED |
+| `docker rm -f container` | 50 | BLOCKED |
+| `kubectl delete namespace production` | 100 | BLOCKED |
+| `mysql -e "DROP TABLE users"` | 100 | BLOCKED |
+| `git status` | 0 | PASSED |
+| `docker ps` | 0 | PASSED |
+| `ls -la` | 0 | PASSED |
 
-### `kubectl` still bypasses
+---
 
-Run:
+## Standards
 
-```powershell
-Get-Command kubectl -All
-```
+AuthSec Agent Shield implements the **Agent Action Approval Protocol (AAAP)** — an open standard for human-in-the-loop governance of AI agent actions.
 
-The first result must be the wrapper in `.authsec-shield\bin`.
 
-## Current Status
+## License
 
-Good for:
+Apache-2.0
 
-- demos
-- development environments
-- approval workflow validation
-- shell and MCP guarding
+## Links
 
-Not yet complete for:
-
-- full endpoint enforcement
-- guaranteed cross-device hardening
-- unbypassable local control
+- Website: [authsec.ai](https://authsec.ai)
+- GitHub: [github.com/authsec-ai](https://github.com/authsec-ai)

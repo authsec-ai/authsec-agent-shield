@@ -3,32 +3,53 @@ package hooks
 import (
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
+
+	"github.com/authsec-ai/authsec-agent-shield/internal/wrappers"
 )
 
 // Install installs shell hooks for all detected shells
 func Install() ([]string, error) {
 	var installed []string
+	var errs []string
 
 	switch runtime.GOOS {
 	case "windows":
 		if err := installPowerShell(); err == nil {
 			installed = append(installed, "PowerShell")
+		} else {
+			errs = append(errs, "PowerShell: "+err.Error())
 		}
 		// Also install bash hooks on Windows — Claude Code, Codex, and other
 		// AI tools use Git Bash/MSYS2, not PowerShell
 		if err := installBash(); err == nil {
 			installed = append(installed, "Git Bash")
+		} else {
+			errs = append(errs, "Git Bash: "+err.Error())
+		}
+		if err := installCMD(); err == nil {
+			installed = append(installed, "CMD")
+		} else {
+			errs = append(errs, "CMD: "+err.Error())
 		}
 	default:
 		if err := installBash(); err == nil {
 			installed = append(installed, "Bash")
+		} else {
+			errs = append(errs, "Bash: "+err.Error())
 		}
 		if err := installZsh(); err == nil {
 			installed = append(installed, "Zsh")
+		} else {
+			errs = append(errs, "Zsh: "+err.Error())
 		}
+	}
+
+	if len(errs) > 0 {
+		return installed, fmt.Errorf(strings.Join(errs, "; "))
 	}
 
 	return installed, nil
@@ -49,6 +70,7 @@ func UninstallForHome(home string) error {
 	switch runtime.GOOS {
 	case "windows":
 		removeHookFromFile(filepath.Join(home, ".bashrc")) // Git Bash cleanup
+		uninstallCMD()
 		var firstErr error
 		for _, path := range powerShellProfilePathsForHome(home) {
 			if err := removeHookFromFile(path); err != nil && firstErr == nil {
@@ -88,7 +110,7 @@ else
     __authsec_shield_trap() {
         [ -n "$COMP_LINE" ] && return
         [ "$BASH_COMMAND" = "$PROMPT_COMMAND" ] && return
-        authsec_shield_preexec "$BASH_COMMAND"
+        authsec_shield_preexec "$BASH_COMMAND" || kill -SIGINT $$
     }
     trap '__authsec_shield_trap' DEBUG
 fi
@@ -120,6 +142,7 @@ func powershellHookScript() string {
 $env:PATH = "%s;$env:PATH"
 $Global:AuthSecShieldValidation = {
     param([string]$CommandLine)
+    if ($env:AUTHSEC_SHIELD_ACTIVE -eq "1") { return }
     $result = & "%s" check $CommandLine 2>&1
     if ($LASTEXITCODE -ne 0) {
         throw "Blocked by AuthSec Agent Shield"
@@ -130,7 +153,8 @@ Set-PSReadLineOption -CommandValidationHandler $Global:AuthSecShieldValidation
 function global:Invoke-AuthSecShieldCheck {
     param([string]$CommandLine)
     if ([string]::IsNullOrWhiteSpace($CommandLine)) { return }
-    & "%s" check $CommandLine 2>&1 | Out-Null
+    if ($env:AUTHSEC_SHIELD_ACTIVE -eq "1") { return }
+    $null = & "%s" check $CommandLine
     if ($LASTEXITCODE -ne 0) {
         throw "Blocked by AuthSec Agent Shield"
     }
@@ -388,6 +412,15 @@ func DiagnoseHooks() map[string]bool {
 		result["powershell"] = false
 	}
 
+	// CMD (Windows only — AutoRun registry key)
+	if runtime.GOOS == "windows" {
+		script := `(Get-ItemProperty -Path "HKCU:\Software\Microsoft\Command Processor" ` +
+			`-Name AutoRun -ErrorAction SilentlyContinue).AutoRun`
+		out, err := exec.Command("powershell.exe", "-NoProfile", "-NonInteractive",
+			"-Command", script).Output()
+		result["cmd"] = err == nil && strings.Contains(string(out), "cmd-hook.bat")
+	}
+
 	return result
 }
 
@@ -397,6 +430,140 @@ func fileContainsHook(path string) bool {
 		return false
 	}
 	return strings.Contains(string(data), hookMarkerStart)
+}
+
+// InstallWSL installs a bash hook inside the default WSL distribution.
+// It converts the Windows shield.exe path to a WSL mount path and appends
+// the hook to ~/.bashrc in WSL. No-op on non-Windows or when WSL is absent.
+func InstallWSL(shieldExePath string) error {
+	if runtime.GOOS != "windows" {
+		return fmt.Errorf("WSL install only supported on Windows")
+	}
+	if _, err := exec.LookPath("wsl.exe"); err != nil {
+		return fmt.Errorf("wsl.exe not found — WSL not installed")
+	}
+
+	// Verify at least one distro is present
+	out, err := exec.Command("wsl.exe", "--list", "--quiet").Output()
+	if err != nil || strings.TrimSpace(string(out)) == "" {
+		return fmt.Errorf("no WSL distribution found")
+	}
+
+	wslPath := windowsToWSLPath(shieldExePath)
+	hook := wslBashHookScript(wslPath)
+
+	// Write hook to a temp file then append it via wsl bash
+	tmp, err := os.CreateTemp("", "authsec-shield-wsl-*.sh")
+	if err != nil {
+		return fmt.Errorf("failed to create temp file: %w", err)
+	}
+	defer os.Remove(tmp.Name())
+	if _, err := tmp.WriteString(hook); err != nil {
+		tmp.Close()
+		return err
+	}
+	tmp.Close()
+
+	wslTmp := windowsToWSLPath(tmp.Name())
+	// Remove any existing hook block then append the new one
+	bashCmd := fmt.Sprintf(
+		`sed -i '/# >>> authsec-shield >>>/,/# <<< authsec-shield <<</d' ~/.bashrc 2>/dev/null; `+
+			`printf '\n' >> ~/.bashrc; cat '%s' >> ~/.bashrc`,
+		wslTmp,
+	)
+	if out, err := exec.Command("wsl.exe", "bash", "-c", bashCmd).CombinedOutput(); err != nil {
+		return fmt.Errorf("failed to install WSL hook: %w: %s", err, strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
+func wslBashHookScript(wslShieldPath string) string {
+	return fmt.Sprintf(`%s
+# AuthSec Agent Shield - intercepts risky commands for approval (WSL)
+authsec_shield_preexec() {
+    local cmd="$1"
+    if [ -z "$cmd" ]; then return; fi
+    "%s" check "$cmd"
+    if [ $? -ne 0 ]; then
+        kill -INT $$
+    fi
+}
+
+if declare -F preexec > /dev/null 2>&1; then
+    preexec_functions+=(authsec_shield_preexec)
+else
+    __authsec_shield_trap() {
+        [ -n "$COMP_LINE" ] && return
+        [ "$BASH_COMMAND" = "$PROMPT_COMMAND" ] && return
+        authsec_shield_preexec "$BASH_COMMAND" || kill -SIGINT $$
+    }
+    trap '__authsec_shield_trap' DEBUG
+fi
+%s`, hookMarkerStart, wslShieldPath, hookMarkerEnd)
+}
+
+// windowsToWSLPath converts a Windows path to a WSL mount path.
+// e.g. D:\foo\bar.exe → /mnt/d/foo/bar.exe
+func windowsToWSLPath(winPath string) string {
+	if len(winPath) >= 2 && winPath[1] == ':' {
+		drive := strings.ToLower(string(winPath[0]))
+		rest := strings.ReplaceAll(winPath[2:], "\\", "/")
+		return "/mnt/" + drive + rest
+	}
+	return strings.ReplaceAll(winPath, "\\", "/")
+}
+
+func cmdAutoRunScript() string {
+	wrapperDir := wrapperDirPath()
+	shieldBin := shieldBinaryPath()
+	var lines []string
+	lines = append(lines, "@echo off")
+	lines = append(lines, "REM "+hookMarkerStart)
+	lines = append(lines, fmt.Sprintf(`set "PATH=%s;%%PATH%%"`, wrapperDir))
+	for _, cmd := range wrappers.WrappedCommands {
+		realBin := wrappers.ResolveRealBinary(cmd)
+		if realBin == "" {
+			realBin = cmd + ".exe"
+		}
+		lines = append(lines,
+			fmt.Sprintf(`doskey %s="%s" run --display "%s $*" -- "%s" $*`,
+				cmd, shieldBin, cmd, realBin))
+	}
+	lines = append(lines, "REM "+hookMarkerEnd)
+	return strings.Join(lines, "\r\n") + "\r\n"
+}
+
+func installCMD() error {
+	home, _ := os.UserHomeDir()
+	batPath := filepath.Join(home, ".authsec-shield", "cmd-hook.bat")
+	if err := os.MkdirAll(filepath.Dir(batPath), 0755); err != nil {
+		return err
+	}
+	if err := os.WriteFile(batPath, []byte(cmdAutoRunScript()), 0644); err != nil {
+		return err
+	}
+	script := fmt.Sprintf(
+		`New-Item -Path "HKCU:\Software\Microsoft\Command Processor" -Force | Out-Null; `+
+			`Set-ItemProperty -Path "HKCU:\Software\Microsoft\Command Processor" `+
+			`-Name AutoRun -Value '"%s"' -Type String -Force`,
+		strings.ReplaceAll(batPath, "'", "''"),
+	)
+	out, err := exec.Command("powershell.exe", "-NoProfile", "-NonInteractive",
+		"-Command", script).CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("failed to set CMD AutoRun: %w: %s", err, strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
+func uninstallCMD() {
+	home, _ := os.UserHomeDir()
+	batPath := filepath.Join(home, ".authsec-shield", "cmd-hook.bat")
+	os.Remove(batPath)
+
+	script := `Remove-ItemProperty -Path "HKCU:\Software\Microsoft\Command Processor" ` +
+		`-Name AutoRun -ErrorAction SilentlyContinue`
+	exec.Command("powershell.exe", "-NoProfile", "-NonInteractive", "-Command", script).Run() //nolint:errcheck
 }
 
 func shieldBinaryPath() string {
